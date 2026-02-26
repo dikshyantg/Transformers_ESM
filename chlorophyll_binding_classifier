@@ -1,277 +1,253 @@
-import sys
+"""Chlorophyll-binding protein classifier utilities.
+
+This module provides a cleaned and documented workflow for:
+1. Loading and filtering protein embedding files.
+2. Building a balanced sampled dataset across classes.
+3. Padding sequence tensors for model inference.
+4. Running one-batch attention visualization from a trained model.
+
+Notes
+-----
+The project depends on custom modules and project-specific assets:
+- ``cus_load_embedd`` for data loader/model helpers.
+- Local embedding directories containing ``torch.load``-able dictionaries.
+- A model class named ``Chl_Classifier_5`` available at runtime.
+
+The previous version of this script executed immediately on import and relied on
+many implicit globals. This rewrite makes all dependencies explicit and keeps
+execution under ``main()`` for safer reuse.
+"""
+
+from __future__ import annotations
+
 import os
-from torch.utils.data import Dataset
-import re
+import random
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 import torch
-import torch.nn.utils.rnn as rnn_utils
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
 
-# Adding the given directory to the system path
-# to import some custom modules from there
-sys.path.insert(0, os.path.abspath('/duvalldrive/test_g/post_candidacy'))
+# Adding the custom project path for local utilities.
+sys.path.insert(0, os.path.abspath("/duvalldrive/test_g/post_candidacy"))
 
-# Importing some custom functions from 'cus_load_embedd' module
-from cus_load_embedd import load_filtered_embeddings
-from cus_load_embedd import pad_sequences
-from cus_load_embedd import load_sentiment_model
-from cus_load_embedd import load_sentiment_model_multiple_attn
 from cus_load_embedd import create_dataloader
 
-def label_gen(EMB_PATHLST,EMB_LAYER,max_count):
-    """Generates labels for embeddings."""
-    count = 0
-    all_labels = []
 
-    for EMB_PATH in EMB_PATHLST:
-        Xs = []
-        for file in os.listdir(EMB_PATH):
-            if os.path.isfile(os.path.join(EMB_PATH, file)):
-                fn = f'{EMB_PATH}/{file}'
-                embs = torch.load(fn)
+@dataclass(frozen=True)
+class ClassConfig:
+    """Configuration for one classification category.
 
-                # Check label and representation conditions
-                if ('hypothetical' not in str(embs['label'])
-                    and 'proteobact' not in str(embs['label']) and len(embs['representations'][EMB_LAYER]) < 480):
+    Attributes:
+        embedding_dirs: Directories containing saved embedding files.
+        category_id: Integer class label used by the classifier.
+        max_count_per_dir: Maximum number of samples to load from each directory.
+    """
 
-                    Xs.append(embs['label'])
-                    count += 1
+    embedding_dirs: Sequence[str]
+    category_id: int
+    max_count_per_dir: int = 50
 
-                    # Check max count condition
-                    if count >= max_count:
-                        break
 
-        all_labels.extend(Xs)
-        count = 0  # Reset count after each directory
+class ChlDataset(Dataset):
+    """Simple torch dataset for padded embeddings and class labels."""
 
-    return all_labels
+    def __init__(self, sequences: torch.Tensor, labels: Sequence[int]) -> None:
+        self.sequences = sequences
+        self.labels = list(labels)
 
-def read_embeddings(EMB_PATHLST, EMB_LAYER, label, max_count):
-    """Reads embeddings from files."""
-    count = 0
-    all_data = []
-    
-    for EMB_PATH in EMB_PATHLST:
-        Xs = []
-        ys = []
-        for file in os.listdir(EMB_PATH):
-            if os.path.isfile(os.path.join(EMB_PATH, file)):
-                fn = f'{EMB_PATH}/{file}'
-                embs = torch.load(fn)
+    def __len__(self) -> int:
+        return len(self.sequences)
 
-                # Check label and representation conditions
-                if ('hypothetical' not in str(embs['label']) and 'proteobact' not in str(embs['label'])
-                    and len(embs['representations'][EMB_LAYER]) < 480):
-                    
-                    Xs.append(embs['representations'][EMB_LAYER])
-                    ys.append(embs['label'])
-                    count += 1
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        return self.sequences[idx], self.labels[idx]
 
-                    # Check max count condition
-                    if count >= max_count:
-                        break
 
-        all_data.append((Xs, ys))
-        count = 0  # Reset count after each directory
+def _is_valid_embedding_record(embs: dict, emb_layer: int, max_seq_len: int) -> bool:
+    """Check whether an embedding record passes filtering rules."""
+    label = str(embs.get("label", ""))
+    if "hypothetical" in label or "proteobact" in label:
+        return False
 
-    return all_data
+    representations = embs.get("representations", {})
+    if emb_layer not in representations:
+        return False
 
-def mergelst(*args):
-    """Merges all input lists into one."""
-    return [item for lst in args for item in lst]
+    return len(representations[emb_layer]) < max_seq_len
 
-def padding(data, batch_size):
-    """Applies padding to the data."""
-    Xs_list = []
-    ys_list = []
 
-    for batch_start in range(0, len(data), batch_size):
-        batch_data = data[batch_start:batch_start+batch_size]
-        batch_Xs = []
-        batch_ys = []
+def _iter_embedding_files(directories: Sequence[str]) -> Iterable[Path]:
+    """Yield all files from a sequence of directories."""
+    for directory in directories:
+        for name in os.listdir(directory):
+            path = Path(directory) / name
+            if path.is_file():
+                yield path
 
-        for Xs, ys in batch_data:
-            batch_ys.extend(ys)
-            for x in Xs:
-                batch_Xs.append(x)
 
-        # Apply padding to the sequence
-        padded_seqs = rnn_utils.pad_sequence(batch_Xs, batch_first=True)
-        tensor_list = torch.split(padded_seqs, split_size_or_sections=len(Xs), dim=0)
-        batch_Xs = torch.cat(tensor_list, dim=0)
+def load_labels(
+    embedding_dirs: Sequence[str], emb_layer: int, max_count_per_dir: int, max_seq_len: int = 480
+) -> List[str]:
+    """Load label strings from embedding files with filtering."""
+    labels: List[str] = []
 
-        Xs_list.append(batch_Xs)
-        ys_list.append(batch_ys)
-    
-    Xs = torch.cat(Xs_list, dim=0)
-    ys = sum(ys_list, [])
-    return (Xs, ys)
-import numpy as np
-import random
-import pandas as pd
-from torch.nn import functional as F
-from sklearn.model_selection import KFold, train_test_split
-from sklearn.metrics import precision_score, recall_score, f1_score
+    for directory in embedding_dirs:
+        count = 0
+        for path in _iter_embedding_files([directory]):
+            embs = torch.load(path)
+            if _is_valid_embedding_record(embs, emb_layer, max_seq_len):
+                labels.append(embs["label"])
+                count += 1
+                if count >= max_count_per_dir:
+                    break
+    return labels
 
-# Get labels for each category
-label_0 = label_gen(mergelst(ps_with_cl,biosynt_lst),33,50)
-label_1 = label_gen(ps_without_cl,33,50)
-label_2 = label_gen(non_ph_biosynt,33,50)
 
-# Read embeddings for each category
-data_0 = read_embeddings(mergelst(ps_with_cl,biosynt_lst),33,0,50)  # chl binding (positive) data
-data_1 = read_embeddings(ps_without_cl,33,1,50)  # non chl binding ps data
-data_2 = read_embeddings(non_ph_biosynt,33,2,50)  # rest of the proteins (negative) data
+def load_embeddings(
+    embedding_dirs: Sequence[str],
+    emb_layer: int,
+    max_count_per_dir: int,
+    max_seq_len: int = 480,
+) -> List[Tuple[torch.Tensor, str]]:
+    """Load filtered embedding tensors and raw labels.
 
-# Helper functions for random slice and data extraction
-def get_random_slice(data, slice_size):
-    actual_slice_size = min(len(data), slice_size)
-    indices = random.sample(range(len(data)), actual_slice_size)
-    data_slice = [data[i] for i in indices]
-    return data_slice, indices
+    Returns:
+        A flat list of ``(embedding_tensor, label_text)`` pairs.
+    """
+    loaded: List[Tuple[torch.Tensor, str]] = []
 
-def extract_values_labels(data):
-    values, labels = [], []
-    for Xs, ys in data:
-        for x in Xs:
-            values.append(x)
-            labels.append(ys[0])
-    return values, labels
+    for directory in embedding_dirs:
+        count = 0
+        for path in _iter_embedding_files([directory]):
+            embs = torch.load(path)
+            if _is_valid_embedding_record(embs, emb_layer, max_seq_len):
+                loaded.append((embs["representations"][emb_layer], embs["label"]))
+                count += 1
+                if count >= max_count_per_dir:
+                    break
+    return loaded
 
-def extract_labels(data):
-    labels = []
-    for Xs in data:
-        for x in Xs:
-            labels.append(x)
-    return labels 
 
-# Extract the values and labels from data_0, data_1, and data_2
-data_0_values, data_0_categ = extract_values_labels(data_0)
-data_1_values, data_1_categ = extract_values_labels(data_1)
-data_2_values, data_2_categ = extract_values_labels(data_2)
+def sample_class_data(
+    examples: Sequence[Tuple[torch.Tensor, str]], category_id: int, slice_size: int
+) -> List[Tuple[torch.Tensor, int]]:
+    """Randomly sample examples and convert them to integer class labels."""
+    n = min(len(examples), slice_size)
+    indices = random.sample(range(len(examples)), n)
+    return [(examples[i][0], category_id) for i in indices]
 
-label_sin_0 = extract_labels(label_0)
-label_sin_1 = extract_labels(label_1)
-label_sin_2 = extract_labels(label_2)
 
-# Get random slices of size 10 from the values and labels of data_0, data_1, and data_2
-slice_size = 10
-slice_idx_2 = 10
-idx_0 = random.sample(range(len(data_0_values)), slice_size )
-idx_1 = random.sample(range(len(data_1_values)), slice_size )
-idx_2 = random.sample(range(len(data_2_values)), slice_idx_2)
+def pad_or_truncate_batch(sequences: Sequence[torch.Tensor], max_length: int = 450) -> torch.Tensor:
+    """Pad or truncate each sequence to a fixed length and stack them."""
+    processed: List[torch.Tensor] = []
+    for seq in sequences:
+        seq_len = seq.size(0)
+        if seq_len < max_length:
+            padded_seq = F.pad(seq, (0, 0, 0, max_length - seq_len), value=0)
+        else:
+            padded_seq = seq[:max_length]
+        processed.append(padded_seq)
+    return torch.stack(processed, dim=0)
 
-# Use the same indices for values and labels
-data_0_val_slice = [data_0_values[i] for i in idx_0]
-data_0_label_slice = [label_sin_0[i] for i in idx_0]
-data_0_categ_slice = [0] * len(data_0_val_slice)
-data_1_val_slice = [data_1_values[i] for i in idx_1]
-data_1_label_slice = [label_sin_1[i] for i in idx_1]
-data_1_categ_slice = [1] * len(data_1_val_slice)
-data_2_val_slice = [data_2_values[i] for i in idx_2]
-data_2_label_slice = [label_sin_2[i] for i in idx_2]
-data_2_categ_slice = [2] * len(data_2_val_slice)
 
-# Combine the values and labels slices
-data_0_slice = list(zip(data_0_val_slice, data_0_categ_slice))
-data_1_slice = list(zip(data_1_val_slice, data_1_categ_slice))
-data_2_slice = list(zip(data_2_val_slice, data_2_categ_slice))
+def build_train_dataset(
+    class_configs: Sequence[ClassConfig],
+    emb_layer: int,
+    slice_size: int = 10,
+) -> Tuple[ChlDataset, torch.Tensor, List[int]]:
+    """Build a sampled dataset and return train split plus full sampled data."""
+    sampled: List[Tuple[torch.Tensor, int]] = []
 
-# Padding and organization of data for further usage
-Xs_list, ys_list = [], []
-for Xs, ys in data_0_slice + data_1_slice + data_2_slice:
-    Xs_list.append(Xs)
-    ys_list.append(ys)
+    for config in class_configs:
+        examples = load_embeddings(config.embedding_dirs, emb_layer, config.max_count_per_dir)
+        sampled.extend(sample_class_data(examples, config.category_id, slice_size))
 
-# Pad sequences to a max_length
-import torch.nn.functional as F
-padded_Xs_list = []
-max_length = 450
-for i in Xs_list:
-    seq_length = i.size(0)
-    if seq_length < max_length:
-        padded_seq = F.pad(i, (0,0,0, max_length-seq_length), value=0)
-    else:
-        padded_seq = i[:max_length]
-    padded_Xs_list.append(padded_seq)
+    sequences = [item[0] for item in sampled]
+    labels = [item[1] for item in sampled]
+    input_data = pad_or_truncate_batch(sequences)
 
-# Prepare the data for model training using sklearn functions
-from sklearn.model_selection import KFold, train_test_split
-class Chl_Dataset(Dataset):
-    def __init__(self, sentences, labels):
-        self.sentences = sentences
-        self.labels = labels
-    def __len__(self):
-        return len(self.sentences)
-    def __getitem__(self, idx):
-        return self.sentences[idx], self.labels[idx]
+    x_train, _x_test, y_train, _y_test = train_test_split(
+        input_data, labels, test_size=0.2, random_state=42
+    )
+    return ChlDataset(x_train, y_train), input_data, labels
 
-input_data = torch.stack(padded_Xs_list, dim=0)
-labels = ys_list
-X_train, X_test, y_train, y_test = train_test_split(input_data, labels, test_size=0.2, random_state=42)
-dataset = Chl_Dataset(X_train, y_train)
-# Load the pre-trained model and its state
-model_dict_path = "model_fold1.pt"
-model = Chl_Classifier_5()
-weights_dict = torch.load(model_dict_path)
-model.load_state_dict(weights_dict)
-model.eval()  # Put the model in evaluation mode
 
-# Create a data loader with batch size of 20
-dataload = create_dataloader(dataset, 20)
+def visualize_attention_batch(
+    model: torch.nn.Module,
+    dataloader,
+    fontsize: int = 15,
+) -> None:
+    """Visualize three attention heads for the first batch from a dataloader."""
+    for batch_idx, (batch_sequences, _batch_labels) in enumerate(dataloader):
+        if batch_idx >= 1:
+            break
 
-# For each batch in the data loader
-fontsize =15
-for i, (batch_sentences, batch_labels) in enumerate(dataload):
-    # Process only the first batch
-    if i >= 1:
-        break
-    print (f'this is {i} batch') 
+        print(f"processing batch {batch_idx}")
 
-    # Get the model's output and attention weights for the batch
-    with torch.no_grad():
-        output, alpha1, alpha2, alpha3 = model(batch_sentences[0])
-        x = batch_sentences[0]
-        _, predicted = torch.max(output, 1)  # Get the model's prediction
-        print (predicted)
-        print(f"actual:{batch_sentences[1]}")
+        with torch.no_grad():
+            output, alpha1, alpha2, alpha3 = model(batch_sequences)
+            _, predicted = torch.max(output, 1)
 
-        # Replace actual labels with predicted ones for visualization
-        batch_labels = predicted
+            batch_size, seq_len, _ = batch_sequences.shape
+            alpha1 = alpha1.reshape(batch_size, seq_len)
+            alpha2 = alpha2.reshape(batch_size, seq_len)
+            alpha3 = alpha3.reshape(batch_size, seq_len)
 
-        # Reshape the attention weights to match the input sequence dimensions
-        batch_size, seq_len, _ = x.shape
-        alpha1 = alpha1.reshape(batch_size, seq_len)
-        alpha2 = alpha2.reshape(batch_size, seq_len)
-        alpha3 = alpha3.reshape(batch_size, seq_len)
+            fig, axs = plt.subplots(1, 3, figsize=(20, 7))
+            for i, alpha in enumerate([alpha1, alpha2, alpha3]):
+                sns.heatmap(alpha.detach().cpu().numpy(), cmap="YlGnBu", ax=axs[i])
+                axs[i].set_yticks(np.arange(len(predicted)) + 0.5)
+                axs[i].set_yticklabels(predicted.tolist(), fontsize=fontsize)
+                axs[i].set_xlabel("Input sequence", fontsize=fontsize)
+                axs[i].set_ylabel("Input batch", fontsize=fontsize)
+                axs[i].set_title(
+                    f"Weights across protein sequence in batch (Layer {i + 1})",
+                    fontsize=fontsize,
+                )
+                axs[i].tick_params(axis="x", labelsize=10.5)
+            plt.show()
 
-        # Create subplots for each set of attention weights
-        fig, axs = plt.subplots(1, 3, figsize=(20, 7))
 
-        # Plot attention weights for the first head
-        sns.heatmap(alpha1.detach().numpy(), cmap="YlGnBu", ax=axs[0])
-        # Set y-axis tick labels and labels for the x and y axes and title for the plot
-        axs[0].set_yticks(np.arange(len(batch_labels))+0.5)
-        axs[0].set_yticklabels(batch_labels.tolist(),fontsize=fontsize)
-        axs[0].set_xlabel("Input sequence",fontsize=fontsize)
-        axs[0].set_ylabel("Input batch",fontsize=fontsize)
-        axs[0].set_title("Weights across protein sequence in batch (Layer 1)",fontsize=fontsize)
-        axs[0].tick_params(axis='x', labelsize=10.5)  # Set x-axis tick label font size
+def main() -> None:
+    """Example entrypoint.
 
-        # Repeat the process for the second and third heads
-        sns.heatmap(alpha2.detach().numpy(), cmap="YlGnBu", ax=axs[1])
-        axs[1].set_yticks(np.arange(len(batch_labels))+0.5)
-        axs[1].set_yticklabels(batch_labels.tolist(),fontsize =fontsize)
-        axs[1].set_xlabel("Input sequence",fontsize =fontsize)
-        axs[1].set_ylabel("Input batch ",fontsize=fontsize)
-        axs[1].set_title("Weights across protein sequence in batch (Layer 2)",fontsize=fontsize)
-        axs[1].tick_params(axis='x', labelsize=10.5)
+    Update the placeholder paths and model loading section before running.
+    """
+    # TODO: Replace these placeholders with your actual embedding directory lists.
+    ps_with_cl: List[str] = []
+    biosynt_lst: List[str] = []
+    ps_without_cl: List[str] = []
+    non_ph_biosynt: List[str] = []
 
-        sns.heatmap(alpha3.detach().numpy(), cmap="YlGnBu", ax=axs[2])
-        axs[2].set_yticks(np.arange(len(batch_labels))+0.5)
-        axs[2].set_yticklabels(batch_labels.tolist(),fontsize=fontsize)
-        axs[2].set_xlabel("Input sequence",fontsize=fontsize)
-        axs[2].set_ylabel("Input batch",fontsize=fontsize)
-        axs[2].set_title("Weights across protein sequence in batch (Layer 3)",fontsize=fontsize)
-        axs[2].tick_params(axis='x', labelsize=10.5)
+    if not any([ps_with_cl, biosynt_lst, ps_without_cl, non_ph_biosynt]):
+        raise ValueError(
+            "Please set embedding directory lists in main() before executing this script."
+        )
 
-        # Display the plots
-        plt.show()
+    class_configs = [
+        ClassConfig(embedding_dirs=[*ps_with_cl, *biosynt_lst], category_id=0),
+        ClassConfig(embedding_dirs=ps_without_cl, category_id=1),
+        ClassConfig(embedding_dirs=non_ph_biosynt, category_id=2),
+    ]
+
+    dataset, _input_data, _labels = build_train_dataset(class_configs, emb_layer=33, slice_size=10)
+    dataloader = create_dataloader(dataset, batch_size=20)
+
+    # TODO: Import/create `Chl_Classifier_5` and set the correct checkpoint path.
+    model_dict_path = "model_fold1.pt"
+    model = Chl_Classifier_5()  # type: ignore[name-defined]
+    model.load_state_dict(torch.load(model_dict_path))
+    model.eval()
+
+    visualize_attention_batch(model, dataloader)
+
+
+if __name__ == "__main__":
+    main()
